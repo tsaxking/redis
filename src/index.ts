@@ -1,6 +1,6 @@
 import { createClient } from 'redis';
-import { attemptAsync, type ResultPromise } from '../node_modules/ts-utils/src/check';
-import { EventEmitter } from '../node_modules/ts-utils/src/event-emitter';
+import { attemptAsync, type ResultPromise } from 'ts-utils/check';
+import { EventEmitter } from 'ts-utils/event-emitter';
 import { z } from 'zod';
 
 export namespace Redis {
