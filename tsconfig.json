@@ -1,0 +1,16 @@
+{
+	"compilerOptions": {
+		"rootDir": "./src",
+		"outDir": "./lib/esm",
+		"declarationDir": "./lib/esm",
+		"module": "ESNext",
+		"target": "es2022",
+		"declaration": true,
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true, // Avoid type-checking external library typings
+		"moduleResolution": "bundler",
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", "lib"]
+}

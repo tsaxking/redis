@@ -1,0 +1,16 @@
+{
+	"compilerOptions": {
+		"target": "ESNext", // Modern JavaScript
+		"module": "CommonJS", // CommonJS for backwards compatibility
+		"moduleResolution": "node", // Resolves modules like Node.js does
+		"outDir": "./lib/cjs", // Output directory
+		"esModuleInterop": true, // Allow default imports for non-ESM modules
+		"declaration": true, // Generate type declarations
+		"declarationDir": "./lib/cjs", // Output directory for type declarations
+		"strict": true, // Strict type checking
+		"skipLibCheck": true, // Skip type checking of declaration files
+
+	},
+	"include": ["src/**/*"], // Include all files in src directory
+	"exclude": ["node_modules", "lib"] // Exclude node_modules and lib from compilation
+}
