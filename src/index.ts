@@ -42,24 +42,21 @@ export namespace Redis {
 	}): ResultPromise<void> => {
 		return attemptAsync(async () => {
             if (config.name?.includes(':')) {
-                throw new Error(`Redis name "${name}" cannot contain a colon (:) character.`);
+                throw new Error(`Redis name "${config.name}" cannot contain a colon (:) character.`);
             }
             REDIS_NAME = config.name || REDIS_NAME;
 			if (_sub?.isOpen && _pub?.isOpen && _sub?.isReady && _pub?.isReady) {
 				return; // Already connected
 			}
-			_sub = createClient({
+
+			const clientConfig = {
 				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
 				password: config.password,
-			});
-			_pub = createClient({
-				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
-				password: config.password,
-			});
-			_queue = createClient({
-				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
-				password: config.password,
-			});
+			}
+
+			_sub = createClient(clientConfig);
+			_pub = createClient(clientConfig);
+			_queue = createClient(clientConfig);
 
             _sub.on('error', (error: Error) => {
                 globalEmitter.emit('sub-error', error);
