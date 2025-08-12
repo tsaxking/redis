@@ -23,7 +23,6 @@ export namespace Redis {
 	export let _sub: ReturnType<typeof createClient> | undefined;
 	export let _pub: ReturnType<typeof createClient> | undefined;
 	export let _queue: ReturnType<typeof createClient> | undefined;
-    export let _direct: ReturnType<typeof createClient> | undefined;
 
 
 	/**
@@ -33,18 +32,36 @@ export namespace Redis {
 	* @param timeout Optional timeout in ms for discovery.
 	* @returns ResultPromise<void>
 	*/
-	export const connect = (name?: string, timeout?: number): ResultPromise<void> => {
+	export const connect = (config: {
+		name?: string;
+		timeout?: number;
+		port?: number;
+		host?: string;
+		password?: string;
+	} | {
+		redisUrl?: string;
+		name?: string;
+		timeout?: number;
+	}): ResultPromise<void> => {
 		return attemptAsync(async () => {
-            if (name?.includes(':')) {
-                throw new Error(`Redis name "${name}" cannot contain a colon (:) character.`);
+            if (config.name?.includes(':')) {
+                throw new Error(`Redis name "${config.name}" cannot contain a colon (:) character.`);
             }
-            REDIS_NAME = name || REDIS_NAME;
+            REDIS_NAME = config.name || REDIS_NAME;
 			if (_sub?.isOpen && _pub?.isOpen && _sub?.isReady && _pub?.isReady) {
 				return; // Already connected
 			}
-			_sub = createClient();
-			_pub = createClient();
-			_queue = createClient();
+
+			const clientConfig = {
+				url: 'redisUrl' in config ? config.redisUrl : undefined,
+				port: 'port' in config ? config.port : undefined,
+				host: 'host' in config ? config.host : undefined,
+				password: 'password' in config ? config.password : undefined,
+			}
+
+			_sub = createClient(clientConfig);
+			_pub = createClient(clientConfig);
+			_queue = createClient(clientConfig);
 
             _sub.on('error', (error: Error) => {
                 globalEmitter.emit('sub-error', error);
@@ -107,7 +124,7 @@ export namespace Redis {
 				_pub?.publish('discovery:i_am', REDIS_NAME + ':' + clientId);
 				setTimeout(() => {
 					rej(new Error('Redis connection timed out. Please check your Redis server.'));
-				}, timeout || 1000); // Wait for a second to ensure the discovery messages are processed
+				}, config.timeout || 1000); // Wait for a second to ensure the discovery messages are processed
 			});
 		});
 	};
