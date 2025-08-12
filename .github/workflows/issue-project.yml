@@ -1,0 +1,40 @@
+name: Add New Issue to All Linked Projects
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  add-to-projects:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Add issue to all linked projects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get repo projects
+          projects=$(gh api graphql -f query='
+            query($owner:String!, $repo:String!) {
+              repository(owner: $owner, name: $repo) {
+                projectsV2(first: 20) {
+                  nodes {
+                    id
+                    title
+                  }
+                }
+              }
+            }' -f owner=${{ github.repository_owner }} -f repo=${{ github.event.repository.name }} --jq '.data.repository.projectsV2.nodes[].id')
+
+          # Add issue to each project
+          for project_id in $projects; do
+            echo "Adding issue to project $project_id"
+            gh api graphql -f query='
+              mutation($projectId:ID!, $contentId:ID!) {
+                addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                  item { id }
+                }
+              }' \
+              -f projectId="$project_id" \
+              -f contentId="${{ github.event.issue.node_id }}"
+          done
