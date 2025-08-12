@@ -2,29 +2,38 @@
   "name": "redis-service",
   "version": "1.0.0",
   "description": "",
-	"main": "lib/cjs/index.js",
-	"module": "lib/esm/index.js",
+  "main": "lib/cjs/index.js",
+  "module": "lib/esm/index.js",
   "scripts": {
-		"build": "tsc && tsc -p tsconfig.commonjs.json && node ./scripts/post-build.js",
-		"install": "npm run build",
-		"test": "vitest",
-		"format": "prettier --write .",
-		"lint": "eslint . --ext .ts",
-		"lint:fix": "eslint . --ext .ts --fix"
+    "build": "tsc && tsc -p tsconfig.commonjs.json && node ./scripts/post-build.js",
+    "install": "npm run build",
+    "test": "vitest",
+    "format": "prettier --write .",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "packageManager": "pnpm@10.12.1",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": "v22.12.0"
+  },
   "dependencies": {
     "redis": "^5.5.6",
-    "zod": "^3.25.64",
-		"ts-utils": "github:tsaxking/global-ts-utilities"
+    "ts-utils": "github:tsaxking/global-ts-utilities",
+    "uuid": "^11.1.0",
+    "vitest": "^3.2.4",
+    "zod": "^3.25.64"
   },
   "exports": {
-		".": {
-			"import": "./lib/esm/index.js",
-			"require": "./lib/cjs/index.js"
-		}
+    ".": {
+      "import": "./lib/esm/index.js",
+      "require": "./lib/cjs/index.js"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.1",
+    "@types/uuid": "^10.0.0"
   }
 }

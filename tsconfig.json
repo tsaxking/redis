@@ -1,6 +1,5 @@
 {
 	"compilerOptions": {
-		"rootDir": "./src",
 		"outDir": "./lib/esm",
 		"declarationDir": "./lib/esm",
 		"module": "ESNext",
@@ -9,7 +8,7 @@
 		"strict": true,
 		"esModuleInterop": true,
 		"skipLibCheck": true, // Avoid type-checking external library typings
-		"moduleResolution": "bundler",
+		"moduleResolution": "bundler"
 	},
 	"include": ["src/**/*"],
 	"exclude": ["node_modules", "lib"]

@@ -9,7 +9,7 @@
 		"declarationDir": "./lib/cjs", // Output directory for type declarations
 		"strict": true, // Strict type checking
 		"skipLibCheck": true, // Skip type checking of declaration files
-
+		"noCheck": true // Skip type checking
 	},
 	"include": ["src/**/*"], // Include all files in src directory
 	"exclude": ["node_modules", "lib"] // Exclude node_modules and lib from compilation
