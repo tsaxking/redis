@@ -51,7 +51,24 @@ export namespace Redis {
 
 			const clientConfig = {
 				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
-				password: config.password,
+			let url = config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`;
+			let passwordFromUrl: string | undefined;
+			if (config.redisUrl) {
+				try {
+					const parsed = new URL(config.redisUrl);
+					passwordFromUrl = parsed.password || undefined;
+				} catch (e) {
+					throw new Error(`Invalid redisUrl: ${config.redisUrl}`);
+				}
+			}
+			if (passwordFromUrl && config.password) {
+				throw new Error(
+					'Both redisUrl contains a password and a separate password parameter was provided. Please provide authentication in only one place.'
+				);
+			}
+			const clientConfig = {
+				url,
+				password: config.password || passwordFromUrl || undefined,
 			}
 
 			_sub = createClient(clientConfig);
