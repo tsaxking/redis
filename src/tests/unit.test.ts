@@ -15,7 +15,9 @@ function wait(ms: number) {
 
 describe('Redis', () => {
   beforeAll(async () => {
-    await Redis.connect('test-instance');
+    await Redis.connect({
+      name: 'test-instance',
+    });
   });
 
   afterAll(async () => {
