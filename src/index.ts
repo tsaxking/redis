@@ -38,7 +38,10 @@ export namespace Redis {
 		port?: number;
 		host?: string;
 		password?: string;
+	} | {
 		redisUrl?: string;
+		name?: string;
+		timeout?: number;
 	}): ResultPromise<void> => {
 		return attemptAsync(async () => {
             if (config.name?.includes(':')) {
@@ -50,25 +53,10 @@ export namespace Redis {
 			}
 
 			const clientConfig = {
-				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
-			let url = config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`;
-			let passwordFromUrl: string | undefined;
-			if (config.redisUrl) {
-				try {
-					const parsed = new URL(config.redisUrl);
-					passwordFromUrl = parsed.password || undefined;
-				} catch (e) {
-					throw new Error(`Invalid redisUrl: ${config.redisUrl}`);
-				}
-			}
-			if (passwordFromUrl && config.password) {
-				throw new Error(
-					'Both redisUrl contains a password and a separate password parameter was provided. Please provide authentication in only one place.'
-				);
-			}
-			const clientConfig = {
-				url,
-				password: config.password || passwordFromUrl || undefined,
+				url: 'redisUrl' in config ? config.redisUrl : undefined,
+				port: 'port' in config ? config.port : undefined,
+				host: 'host' in config ? config.host : undefined,
+				password: 'password' in config ? config.password : undefined,
 			}
 
 			_sub = createClient(clientConfig);
@@ -136,7 +124,7 @@ export namespace Redis {
 				_pub?.publish('discovery:i_am', REDIS_NAME + ':' + clientId);
 				setTimeout(() => {
 					rej(new Error('Redis connection timed out. Please check your Redis server.'));
-				}, timeout || 1000); // Wait for a second to ensure the discovery messages are processed
+				}, config.timeout || 1000); // Wait for a second to ensure the discovery messages are processed
 			});
 		});
 	};
