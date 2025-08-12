@@ -23,7 +23,6 @@ export namespace Redis {
 	export let _sub: ReturnType<typeof createClient> | undefined;
 	export let _pub: ReturnType<typeof createClient> | undefined;
 	export let _queue: ReturnType<typeof createClient> | undefined;
-    export let _direct: ReturnType<typeof createClient> | undefined;
 
 
 	/**
@@ -33,18 +32,34 @@ export namespace Redis {
 	* @param timeout Optional timeout in ms for discovery.
 	* @returns ResultPromise<void>
 	*/
-	export const connect = (name?: string, timeout?: number): ResultPromise<void> => {
+	export const connect = (config: {
+		name?: string;
+		timeout?: number;
+		port?: number;
+		host?: string;
+		password?: string;
+		redisUrl?: string;
+	}): ResultPromise<void> => {
 		return attemptAsync(async () => {
-            if (name?.includes(':')) {
+            if (config.name?.includes(':')) {
                 throw new Error(`Redis name "${name}" cannot contain a colon (:) character.`);
             }
-            REDIS_NAME = name || REDIS_NAME;
+            REDIS_NAME = config.name || REDIS_NAME;
 			if (_sub?.isOpen && _pub?.isOpen && _sub?.isReady && _pub?.isReady) {
 				return; // Already connected
 			}
-			_sub = createClient();
-			_pub = createClient();
-			_queue = createClient();
+			_sub = createClient({
+				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
+				password: config.password,
+			});
+			_pub = createClient({
+				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
+				password: config.password,
+			});
+			_queue = createClient({
+				url: config.redisUrl || `redis://${config.host || 'localhost'}:${config.port || 6379}`,
+				password: config.password,
+			});
 
             _sub.on('error', (error: Error) => {
                 globalEmitter.emit('sub-error', error);
