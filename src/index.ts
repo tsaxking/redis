@@ -1,859 +1,655 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
-import { createClient } from 'redis';
-import { attemptAsync, type ResultPromise, attempt, type Result } from 'ts-utils/check';
-import { ComplexEventEmitter, EventEmitter } from 'ts-utils/event-emitter';
-import { z } from 'zod';
-import { v4 as u } from 'uuid';
-import type { Stream } from 'ts-utils/stream';
-import { sleep } from 'ts-utils/sleep';
-
-const log = (...data: unknown[]) => {
-	console.log(`[Redis]`, ...data);
-};
-
-export namespace Redis {
-	// Devs can reassign this to a different UUID generator if they want
-	// eslint-disable-next-line prefer-const
-	export let uuid = u;
-
-	export let REDIS_NAME = 'default';
-	let messageId = -1;
-	export const clientId = uuid();
-	export let _sub: ReturnType<typeof createClient> | undefined;
-	export let _pub: ReturnType<typeof createClient> | undefined;
-	export let _queue: ReturnType<typeof createClient> | undefined;
+import { createClient } from "redis";
+import { attempt, attemptAsync } from "ts-utils/check";
+import { v4 } from "uuid";
+import { ComplexEventEmitter, EventEmitter } from "ts-utils/event-emitter";
+import { z } from "zod";
+import { sleep } from "ts-utils/sleep";
 
 
-	/**
-	* Connects to Redis and initializes pub/sub/queue clients.
-	* Attaches event listeners and performs instance discovery.
-	* @param name Optional name for the Redis instance.
-	* @param timeout Optional timeout in ms for discovery.
-	* @returns ResultPromise<void>
-	*/
-	export const connect = (config: {
-		name?: string;
-		timeout?: number;
-		port?: number;
-		host?: string;
-		password?: string;
-	} | {
-		redisUrl?: string;
-		name?: string;
-		timeout?: number;
-	}): ResultPromise<void> => {
-		return attemptAsync(async () => {
-            if (config.name?.includes(':')) {
-                throw new Error(`Redis name "${config.name}" cannot contain a colon (:) character.`);
-            }
-            REDIS_NAME = config.name || REDIS_NAME;
-			if (_sub?.isOpen && _pub?.isOpen && _sub?.isReady && _pub?.isReady) {
-				return; // Already connected
-			}
+/**
+ * Listens to events emitted from other microservices via Redis pub/sub.
+ * @template Events Event schema map
+ */
+export class ListeningService<Events extends Record<string, z.ZodTypeAny>> {
+    private readonly em = new ComplexEventEmitter<{
+        [K in keyof Events]: [{
+            data: z.infer<Events[K]>;
+            timestamp: number;
+        }];
+    }>();
 
-			const clientConfig = {
-				url: 'redisUrl' in config ? config.redisUrl : undefined,
-				port: 'port' in config ? config.port : undefined,
-				host: 'host' in config ? config.host : undefined,
-				password: 'password' in config ? config.password : undefined,
-			}
+    public readonly on = this.em.on.bind(this.em);
+    public readonly off = this.em.off.bind(this.em);
+    private readonly emit = this.em.emit.bind(this.em);
+    public readonly once = this.em.once.bind(this.em);
+    
+    constructor(
+        public readonly redis: Redis,
+        public readonly target: string,
+        public readonly events: Events,
+    ) {}
 
-			_sub = createClient(clientConfig);
-			_pub = createClient(clientConfig);
-			_queue = createClient(clientConfig);
-
-            _sub.on('error', (error: Error) => {
-                globalEmitter.emit('sub-error', error);
+    /**
+     * Initializes the listener and subscribes to the target's channel.
+     * @param config Optional configuration
+     */
+    public init(config?: {}) {
+        return attempt(() => {
+            this.redis.sub.subscribe(`channel:${this.target}`, (message) => {
+                const parsed = z.object({
+                    event: z.string().refine(e => Object.keys(this.events).includes(e), {
+                        message: 'Unknown event',
+                    }),
+                    data: z.unknown(),
+                    timestamp: z.number(),
+                }).safeParse(JSON.parse(message));
+                if (!parsed.success) {
+                    this.redis.log(`Failed to parse message from ${this.target}:`, parsed.error);
+                    return;
+                }
+                const { event, data, timestamp } = parsed.data;
+                const schema = this.events[event as keyof Events];
+                if (!schema) {
+                    this.redis.log(`Received unknown event ${event} from ${this.target}`);
+                    return;
+                }
+                const dataParsed = schema.safeParse(data);
+                if (!dataParsed.success) {
+                    this.redis.log(`Failed to parse data for event ${event} from ${this.target}:`, dataParsed.error);
+                    return;
+                }
+                this.redis.log(`Received event ${event} from ${this.target}:`, dataParsed.data);
+                this.emit(event as keyof Events, { data: dataParsed.data, timestamp });
             });
-
-            _sub.on('connect', () => {
-                globalEmitter.emit('sub-connect');
-            });
-            _sub.on('disconnect', () => {
-                globalEmitter.emit('sub-disconnect');
-            });
-            _sub.on('reconnect', () => {
-                globalEmitter.emit('sub-reconnect');
-            });
-
-            _pub.on('error', (error: Error) => {
-                globalEmitter.emit('pub-error', error);
-            });
-            _pub.on('connect', () => {
-                globalEmitter.emit('pub-connect');
-            });
-            _pub.on('disconnect', () => {
-                globalEmitter.emit('pub-disconnect');
-            });
-            _pub.on('reconnect', () => {
-                globalEmitter.emit('pub-reconnect');
-            });
-
-            // Listen for direct messages
-            _sub.subscribe(`direct:${REDIS_NAME}`, (message: string) => {
-                
-            });
-
-            // Subscribe to direct messages
-
-
-			await Promise.all([_sub.connect(), _pub.connect(), _queue.connect()]);
-			return new Promise<void>((res, rej) => {
-				_sub?.subscribe('discovery:i_am', (message) => {
-					log(`Received discovery:iam message: ${message}`);
-					const [name, instanceId] = message.split(':');
-					log(`Discovery message from instance: ${name} (${instanceId})`, clientId);
-					if (instanceId === clientId) return res(); // Ignore our own message and resolve. The pub/sub system is working.
-					_pub?.publish('discovery:welcome', REDIS_NAME + ':' + instanceId);
-					log(`Discovered instance: ${name} (${instanceId})`);
-				});
-				_sub?.subscribe('discovery:welcome', (message) => {
-					log(`Received discovery:welcome message: ${message}`);
-					const [name, instanceId] = message.split(':');
-					if (instanceId === clientId) return; // Ignore our own message
-
-					log(`Welcome message from instance: ${name} (${instanceId})`);
-					if (name === REDIS_NAME) {
-						console.warn(
-							`Another instance of Redis with name "${REDIS_NAME}" is already running. This may cause conflicts.`
-						);
-						res();
-					}
-				});
-				_pub?.publish('discovery:i_am', REDIS_NAME + ':' + clientId);
-				setTimeout(() => {
-					rej(new Error('Redis connection timed out. Please check your Redis server.'));
-				}, config.timeout || 1000); // Wait for a second to ensure the discovery messages are processed
-			});
-		});
-	};
-
-	/**
-	* Disconnects all Redis clients and cleans up resources.
-	* @returns ResultPromise<void>
-	*/
-	export const disconnect = () => {
-		return attemptAsync(async () => {
-			if (_sub) {
-				await _sub.close();
-				_sub = undefined;
-			}
-			if (_pub) {
-				await _pub.close();
-				_pub = undefined;
-			}
-            if (_queue) {
-                await _queue.close();
-                _queue = undefined;
-            }
-		});
-	};
-
-	/**
-	* Publishes a typed message to this server's Redis channel for other services to listen to.
-	* @template T Event schema type
-	* @param message The message to publish
-	* @returns ResultPromise<void>
-	*/
-	const publish = <
-		T extends {
-			[key: string]: z.ZodType;
-		}
-	>(
-		message: RedisMessage<T>
-	): ResultPromise<void> => {
-		return attemptAsync(async () => {
-			const payload = JSON.stringify({
-				event: message.event,
-				data: message.data,
-				date: message.date.toISOString(),
-				id: message.id
-			});
-			_pub?.publish('channel:' + REDIS_NAME, payload);
-		});
-	};
-
-	/**
-	* Represents a typed Redis message for pub/sub.
-	* @template T Event schema type
-	*/
-	type RedisMessage<
-		T extends {
-			[key: string]: z.ZodType;
-		}
-	> = {
-		event: keyof T;
-		data: z.infer<T[keyof T]>;
-		date: Date;
-		id: number;
-	};
-
-	/**
-	* Service for listening to typed Redis events on a channel.
-	* @template Events Event schema type
-	* @template Name Channel name type
-	*/
-	class ListeningService<
-		Events extends {
-			[key: string]: z.ZodType;
-		},
-		Name extends string
-	> {
-		// public static services = new Map<string, ListeningService<any, any>>();
-
-		private readonly em = new EventEmitter<{
-			[K in keyof Events]: {
-				date: Date;
-				id: number;
-				data: z.infer<Events[K]>;
-			};
-		}>();
-
-		public on = this.em.on.bind(this.em);
-		public once = this.em.once.bind(this.em);
-		public off = this.em.off.bind(this.em);
-		private emit = this.em.emit.bind(this.em);
-
-		constructor(
-			public readonly name: Name,
-			public readonly events: Events
-		) {
-			if (name === REDIS_NAME) {
-				console.warn(
-					`Service name "${name}" cannot be the same as the Redis instance name "${REDIS_NAME}".`
-				);
-			}
-
-			_sub?.subscribe('channel:' + this.name, (message: string) => {
-				try {
-					const parsed = z
-						.object({
-							event: z.string(),
-							data: z.unknown(),
-							date: z.string().transform((v) => new Date(v)),
-							id: z.number()
-						})
-						.parse(JSON.parse(message));
-
-					if (parsed.event in this.events) {
-						const event = parsed.event as keyof Events;
-						const dataSchema = this.events[event];
-						const data = dataSchema.parse(parsed.data);
-						this.emit(event, {
-							data,
-							date: parsed.date,
-							id: parsed.id
-						});
-					}
-				} catch (error) {
-					console.error(`[Redis:${this.name}] Error parsing message for service:`, error);
-				}
-			});
-
-			// ListeningService.services.set(this.name, this);
-		}
-	}
-
-	/**
-	* Creates a new ListeningService for a channel and event schema.
-	* @template E Event schema type
-	* @template Name Channel name type
-	* @param name Channel name
-	* @param events Event schema
-	* @returns ListeningService<E, Name>
-	*/
-	export const createListeningService = <
-		E extends {
-			[key: string]: z.ZodType;
-		},
-		Name extends string
-	>(
-		name: Name,
-		events: E
-	) => {
-		if (name.includes(':')) {
-			throw new Error(`Service name "${name}" cannot contain a colon (:) character.`);
-		}
-		return new ListeningService(name, events);
-	};
-
-	/**
-	* Emits an event to this server's Redis channel.
-	* @param event Event name
-	* @param data Event data
-	* @returns ResultPromise<void>
-	*/
-	export const emit = (event: string, data: unknown) => {
-		return publish({
-			event,
-			data,
-			date: new Date(),
-			id: messageId++
-		});
-	};
-
-	/**
-	* Sends an event to a specific server's Redis channel.
-	* @param server Target server name
-	* @param event Event name
-	* @param data Event data
-	* @returns ResultPromise<void>
-	*/
-	export const sendTo = (server: string, event: string, data: unknown) => {
-        return attemptAsync<void>(async () => {
-            const pub = getPub().unwrap();
-            await pub.publish(
-                `channel:${server}`,
-                JSON.stringify({
-                    event,
-                    data,
-                    date: new Date().toISOString(),
-                    id: messageId++
-                }),
-            );
         });
-    };
+    }
+}
+
+/**
+ * Provides two-way, ack-based, type-safe communication between two microservices using Redis queues.
+ * @template Events Event schema map
+ */
+export class ConnectionService<Events extends Record<string, z.ZodTypeAny>> {
+    private messageId = -1;
+
+    private readonly sendQueue: QueueService<{
+        event: string;
+        data?: unknown;
+        id: number;
+    }>;
+    private readonly recieveQueue: QueueService<{
+        event: string;
+        data?: unknown;
+        id: number;
+    }>;
+
+    private readonly ackQueue = new Map<number, (data: unknown) => void>();
+    private readonly subscribers = new Map<keyof Events, (data: z.infer<Events[keyof Events]>) => unknown>();
+
+    constructor(
+        public readonly redis: Redis,
+        public readonly target: string,
+        public readonly events: Events,
+    ) {
+        const eventSchema = z.object({
+            event: z.string().refine(e => Object.keys(events).includes(e), {
+                message: 'Unknown event',
+            }),
+            data: z.unknown(),
+            id: z.number(),
+        });
+
+        // cache if the connection dies
+        this.sendQueue = redis.createQueue(`connection:${this.redis.name}:${this.target}`, eventSchema);
+        this.recieveQueue = redis.createQueue(`connection:${this.target}:${this.redis.name}`, eventSchema);
+    }
+
+    /**
+     * Initializes the connection service and starts listening for events and acks.
+     * @param config Optional polling configuration
+     */
+    init(config?: {
+        polling?: number;
+    }) {
+        return attempt(() => {
+            this.sendQueue.init(config).unwrap();
+            this.recieveQueue.init(config).unwrap();
+
+            this.recieveQueue.on('data', async (data) => {
+                const { event, data: eventData, id } = data;
+                const schema = this.events[event as keyof Events];
+                if (!schema) {
+                    this.redis.log(`Received unknown event ${event} from ${this.target}`);
+                    return;
+                }
+                const parsed = schema.safeParse(eventData);
+                if (!parsed.success) {
+                    this.redis.log(`Failed to parse event ${event} from ${this.target}:`, parsed.error);
+                    return;
+                }
+                this.redis.log(`Received event ${event} from ${this.target}:`, parsed.data);
+
+                const listener = this.subscribers.get(event as keyof Events);
+                if (listener) {
+                    try {
+                        const res = await listener(parsed.data);
+                        this.ack(id, res);
+                    } catch (err) {
+                        this.redis.log(`Error in listener for event ${event} from ${this.target}:`, err);
+                    }
+                } else {
+                    this.redis.log(`No listener for event ${event} from ${this.target}`);
+                }
+            });
+
+            this.redis.sub.subscribe(`connection:ack:${this.redis.name}:${this.target}`, (message) => {
+                const parsed = z.object({
+                    id: z.number(),
+                    data: z.unknown(),
+                }).safeParse(JSON.parse(message));
+                if (!parsed.success) {
+                    this.redis.log(`Received invalid ack message: ${message}`);
+                    return;
+                }
+                const { id, data } = parsed.data;
+                if (isNaN(id)) {
+                    this.redis.log(`Received invalid ack message: ${message}`);
+                    return;
+                }
+                this.redis.log(`Received ack for message id ${id} from ${this.target}`);
+                const ack = this.ackQueue.get(id);
+                if (ack) {
+                    ack(data);
+                }
+            });
+        });
+    }
+
+    /**
+     * Sends an event to the target service and waits for an ack (and optional return value).
+     * @template K Event key
+     * @template R Return type
+     * @param event Event name
+     * @param config Data, optional timeout, and optional returnType for response
+     * @returns Promise resolving to R (if returnType is provided) or void
+     */
+    send<K extends keyof Events, R = undefined>(event: K, config: {
+        data: z.infer<Events[K]>;
+        timeout?: number;
+        returnType?: z.ZodType<R>;
+    }) {
+        return attemptAsync<R>(async () => {
+            await this.sendQueue.add({ event: event as string, data: config.data, id: ++this.messageId });
+            this.redis.log(`Sent event ${String(event)} to ${this.target}:`, config.data);
+
+            return new Promise<R>((res, rej) => {
+                const t = setTimeout(() => {
+                    this.ackQueue.delete(this.messageId);
+                    rej(new Error(`Ack timeout for message id ${this.messageId}`));
+                }, config.timeout);
+
+                this.ackQueue.set(this.messageId, (data) => {
+                    clearTimeout(t);
+                    this.ackQueue.delete(this.messageId);
+                    if (config.returnType) {
+                        const parsed = config.returnType.safeParse(data);
+                        if (!parsed.success) {
+                            rej(new Error(`Failed to parse return data for message id ${this.messageId}: ${parsed.error}`));
+                            return;
+                        }
+                        res(parsed.data);
+                    } else {
+                        res(undefined as R);
+                    }
+                });
+            });
+        });
+    }
+
+    /**
+     * Sends an ack for a received message back to the sender.
+     * @param id Message id
+     * @param data Optional return data
+     */
+    private ack(id: number, data: unknown) {
+        return attemptAsync(async () => {
+            await this.redis.pub.publish(`connection:ack:${this.target}:${this.redis.name}`, JSON.stringify({ id, data }));
+            this.redis.log(`Sent ack for message id ${id} to ${this.target}`);
+        });
+    }
+
+    /**
+     * Subscribes to a specific event from the target service.
+     * @template K Event key
+     * @param event Event name
+     * @param listener Listener function
+     * @returns Unsubscribe function
+     */
+    public subscribe<K extends keyof Events>(event: K, listener: (data: z.infer<Events[K]>) => unknown) {
+        if (this.subscribers.has(event)) {
+            throw new Error(`Listener for event ${String(event)} already exists`);
+        }
+        this.subscribers.set(event, listener);
+        return () => {
+            this.subscribers.delete(event);
+        }
+    }
+}
+
+/**
+ * Provides a type-safe Redis-backed queue with event emission for new data.
+ * @template T Data type
+ */
+export class QueueService<T> {
+    private readonly em = new ComplexEventEmitter<{
+        data: [T];
+        clear: void;
+    }>();
+
+    public readonly on = this.em.on.bind(this.em);
+    public readonly off = this.em.off.bind(this.em);
+    private readonly emit = this.em.emit.bind(this.em);
+    public readonly once = this.em.once.bind(this.em);
+
+    constructor(
+        public readonly redis: Redis,
+        public readonly name: string,
+        public readonly schema: z.ZodType<T>,
+    ) {}
+
+    /**
+     * Initializes the queue and starts polling for new items.
+     * @param config Optional polling and jitter configuration
+     */
+    init(config?: {
+        polling?: number;
+        jitter?: number;
+    }) {
+        return attempt(() => {
+            this.redis.log(`QueueService initialized for ${this.name}`);
+
+            // listens for new items in the queue
+            const listen = async () => {
+                while (true) {
+                    await sleep(config?.polling || 50 + Math.floor(Math.random() * (config?.jitter || 10)));
+                    const item = await this.redis.cache.lPop(`queue:${this.name}`);
+                    if (item) {
+                        const parsed = this.schema.safeParse(JSON.parse(item));
+                        if (parsed.success) {
+                            this.redis.log(`Dequeued value for queue ${this.name}:`, parsed.data);
+                            this.emit('data', parsed.data);
+                        } else {
+                            this.redis.log(`Failed to parse dequeued item for queue ${this.name}:`, parsed.error);
+                        }
+                    }
+                }
+            }
+
+            listen().catch((err) => {
+                this.redis.log(`Error in listening to queue ${this.name}:`, err);
+            });
+        });
+    }
+
+    /**
+     * Returns all items currently in the queue.
+     * @returns Promise of parsed items
+     */
+    stack() {
+        return attemptAsync(async () => {
+            const data = await this.redis.cache.lRange(`queue:${this.name}`, 0, -1);
+            return data.map((item) => this.schema.parse(JSON.parse(item)));
+        });
+    }
+
+    /**
+     * Adds a value to the queue.
+     * @param value Value to enqueue
+     * @returns Promise of queue length after add
+     */
+    add(value: T) {
+        return attemptAsync(async () => {
+            const i = await this.redis.cache.rPush(`queue:${this.name}`, JSON.stringify(value));
+            this.redis.log(`Enqueued value for queue ${this.name}:`, value);
+            return i;
+        });
+    }
+
+    /**
+     * Returns the current length of the queue.
+     * @returns Promise of queue length
+     */
+    length() {
+        return attemptAsync(async () => {
+            const len = await this.redis.cache.lLen(`queue:${this.name}`);
+            this.redis.log(`Queue ${this.name} length:`, len);
+            return len;
+        });
+    }
+
+    /**
+     * Clears all items from the queue.
+     * @returns Promise<void>
+     */
+    clear() {
+        return attemptAsync(async () => {
+            await this.redis.cache.del(`queue:${this.name}`);
+            this.redis.log(`Cleared queue ${this.name}`);
+        });
+    }
+}
+
+/**
+ * Provides type-safe get/set/delete/expire operations for a single Redis key.
+ * @template T Data type
+ */
+export class ItemService<T> {
+    constructor(
+        public readonly redis: Redis,
+        public readonly name: string,
+        public readonly schema: z.ZodType<T>,
+    ) {
+        this.redis.log(`ItemService initialized for ${name}`);
+    }
+
+    /**
+     * Gets the value for this item from Redis.
+     * @returns Promise of parsed value
+     */
+    get() {
+        return attemptAsync<T>(async () => {
+            const data = await this.redis.cache.get(`item:${this.name}`);
+            if (data === null) {
+                throw new Error(`Item ${this.name} not found`);
+            }
+            return this.schema.parse(JSON.parse(data));
+        });
+    }
+
+    /**
+     * Deletes this item from Redis.
+     * @returns Promise<void>
+     */
+    delete() {
+        return attemptAsync(async () => {
+            await this.redis.cache.del(`item:${this.name}`);
+            this.redis.log(`Deleted item ${this.name}`);
+        });
+    }
+
+    /**
+     * Sets the value for this item in Redis.
+     * @param value Value to set
+     * @returns Promise<void>
+     */
+    set(value: T) {
+        return attemptAsync(async () => {
+            await this.redis.cache.set(`item:${this.name}`, JSON.stringify(value));
+            this.redis.log(`Set raw value for item ${this.name}:`, value);
+        });
+    }
+
+    /**
+     * Sets expiration for this item in seconds.
+     * @param seconds Expiration time in seconds
+     * @returns Promise<void>
+     */
+    expire(seconds: number) {
+        return attemptAsync(async () => {
+            await this.redis.cache.expire(`item:${this.name}`, seconds);
+            this.redis.log(`Set expiration for item ${this.name} to ${seconds} seconds`);
+        });
+    }
+
+    /**
+     * Sets expiration for this item at a specific timestamp.
+     * @param timestamp Unix timestamp (seconds)
+     * @returns Promise<void>
+     */
+    expiresAt(timestamp: number) {
+        return attemptAsync(async () => {
+            await this.redis.cache.expireat(`item:${this.name}`, timestamp);
+            this.redis.log(`Set expiration for item ${this.name} at ${new Date(timestamp * 1000).toISOString()}`);
+        });
+    }
+}
+
+export class NumberService extends ItemService<number> {
+    constructor(redis: Redis, name: string) {
+        super(redis, name, z.number());
+        this.redis.log(`NumberService initialized for ${name}`);
+    }
+
+    /**
+     * Increments the value by a given amount.
+     * @param amount Amount to increment by
+     * @returns Promise of new value
+     */
+    incr(amount = 1) {
+        return attemptAsync(async () => {
+            const val = await this.get().unwrapOr(0);
+            const newValue = val + amount;
+            await this.set(newValue);
+            this.redis.log(`Incremented ${this.name} by ${amount}, new value: ${newValue}`);
+            return newValue;
+        });
+    }
+
+    /**
+     * Decrements the value by a given amount.
+     * @param amount Amount to decrement by
+     * @returns Promise of new value
+     */
+    decr(amount = 1) {
+        return this.incr(-amount);
+    }
+}
+
+export class StringService extends ItemService<string> {
+    constructor(redis: Redis, name: string) {
+        super(redis, name, z.string());
+        this.redis.log(`StringService initialized for ${name}`);
+    }
+
+    /**
+     * Returns the length of the string value.
+     * @returns Promise<number>
+     */
+    length() {
+        return attemptAsync(async () => {
+            return this.get().unwrap().then(v => v.length);
+        });
+    }
+}
+
+
+/**
+ * Main Redis utility class for microservice communication, queue, and item management.
+ */
+export class Redis {
+    public readonly id: string;
+    public readonly pub: ReturnType<typeof createClient>;
+    public readonly sub: ReturnType<typeof createClient>;
+    public readonly cache: ReturnType<typeof createClient>;
+
+    private readonly em = new ComplexEventEmitter();
+
+    public readonly on = this.em.on.bind(this.em);
+    public readonly off = this.em.off.bind(this.em);
+    private readonly _emit = this.em.emit.bind(this.em);
+    public readonly once = this.em.once.bind(this.em);
+    
+    constructor(
+        public readonly config: {
+            name: string;
+            port?: number;
+            host?: string;
+            password?: string;
+            id?: string;
+            debug?: boolean;
+        }
+    ) {
+        const { port = 6379, host = "localhost", password } = config;
+        this.pub = createClient({ url: `redis://${host}:${port}`, password });
+        this.sub = createClient({ url: `redis://${host}:${port}`, password });
+        this.cache = createClient({ url: `redis://${host}:${port}`, password });
+        this.id = config.id || v4();
+    }
+
+    // can be rewritten for NTP
+    /**
+     * Returns the current timestamp (ms). Can be replaced for NTP.
+     */
+    public now = () => Date.now();
+
+    /**
+     * Logs data if debug is enabled.
+     * @param data Data to log
+     */
+    log(...data: unknown[]) {
+        if (this.config.debug) {
+            console.log(`[Redis ${this.config.name}]`, ...data);
+        }
+    }
+    
+    /**
+     * Returns the configured name for this Redis instance.
+     */
+    get name() {
+        return this.config.name;
+    }
+
+    /**
+     * Initializes all Redis clients and performs discovery handshake.
+     * @param timeout Optional timeout in ms
+     * @returns Promise<void>
+     */
+    init(timeout?: number) {
+        return attemptAsync(async () => {
+
+            [this.pub, this.sub, this.cache].forEach((client) => {});
+
+
+            await Promise.all([this.pub.connect(), this.sub.connect(), this.cache.connect()]);
+            return new Promise<void>((res, rej) => {
+                this.sub.subscribe('discovery:i_am', (message) => {
+                    this.log(`Received discovery:iam message: ${message}`);
+                    const [name, instanceId] = message.split(':');
+                    this.log(`Discovery message from instance: ${name} (${instanceId})`, this.id);
+                    if (instanceId === this.id) return res(); // Ignore our own message and resolve. The pub/sub system is working.
+                    this.pub.publish('discovery:welcome', this.name + ':' + instanceId);
+                    this.log(`Discovered instance: ${name} (${instanceId})`);
+                });
+                this.sub.subscribe('discovery:welcome', (message) => {
+                    this.log(`Received discovery:welcome message: ${message}`);
+                    const [name, instanceId] = message.split(':');
+                    if (instanceId === this.id) return; // Ignore our own message
+
+                    this.log(`Welcome message from instance: ${name} (${instanceId})`);
+                    if (name === this.name) {
+                        console.warn(
+                            `Another instance of Redis with name "${this.name}" is already running. This may cause conflicts.`
+                        );
+                        res();
+                    }
+                });
+                this.pub.publish('discovery:i_am', this.name + ':' + this.id);
+                setTimeout(() => {
+                    rej(new Error('Redis connection timed out. Please check your Redis server.'));
+                }, timeout || 1000); // Wait for a second to ensure the discovery messages are processed
+            });
+        });
+    }
+
+    /**
+     * Emits an event to this instance's channel.
+     * @param event Event name
+     * @param data Event data
+     * @returns Promise<void>
+     */
+    emit(event: string, data: unknown) {
+        return attemptAsync(async () => {
+            this.pub.publish(`channel:${this.name}`, JSON.stringify({ event, data, timestamp: this.now() }) );
+        });
+    }
+
+    /**
+     * Creates an item service for a given key and type.
+     * @template T Data type
+     * @param name Key name
+     * @param type Data type ('object', 'number', 'string')
+     * @param schema Zod schema (required for 'object')
+     * @returns ItemService, NumberService, or StringService
+     */
+    createItem<T>(name: string, type: 'object', schema: z.ZodType<T>): ItemService<T>;
+    createItem(name: string, type: 'number'): NumberService;
+    createItem(name: string, type: 'string'): StringService;
+    createItem<T>(name: string, type: 'object' | 'number' | 'string', schema?: z.ZodType<T>) {
+        this.log(`Creating item service for ${name} of type ${type}`);
+        switch (type) {
+            case 'object':
+                if (!schema) throw new Error('Schema is required for object type');
+                return new ItemService<T>(this, name, schema);
+            case 'number':
+                return new NumberService(this, name);
+            case 'string':
+                return new StringService(this, name);
+            default:
+                throw new Error(`Unknown item type: ${type}`);
+        }
+    }
+
+    /**
+     * Creates a queue service for a given name and schema.
+     * @template T Data type
+     * @param name Queue name
+     * @param schema Zod schema
+     * @returns QueueService<T>
+     */
+    createQueue<T>(name: string, schema: z.ZodType<T>) {
+        this.log(`Creating queue service for ${name}`);
+        return new QueueService<T>(this, name, schema);
+    }
+
+    /**
+     * Creates a connection service for two-way communication with a target.
+     * @template Events Event schema map
+     * @param target Target service name
+     * @param events Event schema map
+     * @returns ConnectionService<Events>
+     */
+    createConnection<Events extends Record<string, z.ZodTypeAny>>(target: string, events: Events) {
+        return new ConnectionService<Events>(this, target, events);
+    }
+
+    private readonly listeningServices = new Set<ListeningService<any>>();
+
+    /**
+     * Creates a listening service for pub/sub events from a target.
+     * @template Events Event schema map
+     * @param target Target service name
+     * @param events Event schema map
+     * @returns ListeningService<Events>
+     */
+    createListener<Events extends Record<string, z.ZodTypeAny>>(target: string, events: Events) {
+        const service = new ListeningService<Events>(this, target, events);
+        this.listeningServices.add(service);
+        return service;
+    }
+
 
 	/**
-	* Global Redis events emitted by the system.
-	*/
-	type GlobalEvents = {
-		'pub-error': [Error];
-		'pub-connect': void;
-		'pub-disconnect': void;
-		'pub-reconnect': void;
-		'sub-error': [Error];
-		'sub-connect': void;
-		'sub-disconnect': void;
-		'sub-reconnect': void;
-		'message': [string, unknown]; // Event name and data
-	};
-
-	const globalEmitter = new ComplexEventEmitter<GlobalEvents>();
-
-	/**
-	* Subscribes to a global Redis event.
-	*/
-	export const on = globalEmitter.on.bind(globalEmitter);
-	/**
-	 * Subscribes once to a global Redis event.
+	 * Closes all Redis clients and cleans up resources.
+	 * @returns Promise<void>
 	 */
-	export const once = globalEmitter.once.bind(globalEmitter);
-	/**
-	 * Unsubscribes from a global Redis event.
-	 */
-	export const off = globalEmitter.off.bind(globalEmitter);
-
-	/**
-	* Sends a query to a service and waits for a typed response.
-	* @template Req Request type
-	* @template Res Response type
-	* @param service Target service name
-	* @param event Event name
-	* @param data Request data
-	* @param returnType Zod schema for response
-	* @param timeoutMs Timeout in ms
-	* @returns ResultPromise<Res>
-	*/
-	export const query = <Req, Res>(
-		service: string,
-		event: string,
-		data: Req,
-		returnType: z.ZodType<Res>,
-		timeoutMs = 1000
-	) => {
-		return attemptAsync<Res>(async () => {
-			const requestId = uuid();
-			const responseChannel = `response:${service}:${requestId}`;
-			const queryChannel = `query:${service}:${event}`;
-
-			const responsePromise = new Promise<Res>((resolve, reject) => {
-				const timeout = setTimeout(() => {
-					_sub?.unsubscribe(responseChannel);
-					reject(new Error(`Request timed out after ${timeoutMs}ms`));
-				}, timeoutMs);
-
-				const ondata = (message: string) => {
-					try {
-						const parsed = z
-							.object({
-								data: z.unknown(),
-								date: z.string().transform((v) => new Date(v)),
-								id: z.number()
-							})
-							.parse(JSON.parse(message));
-
-						const validated = returnType.safeParse(parsed.data);
-						if (!validated.success) {
-							return reject(
-								new Error(`Invalid response data: ${JSON.stringify(validated.error.issues)}`)
-							);
-						}
-						clearTimeout(timeout);
-						resolve(validated.data);
-					} catch (err) {
-						clearTimeout(timeout);
-						reject(err);
-					}
-					_sub?.unsubscribe(responseChannel);
-				};
-
-				_sub?.subscribe(responseChannel, ondata);
-			});
-
-			await _pub?.publish(
-				queryChannel,
-				JSON.stringify({
-					data,
-					requestId,
-					responseChannel,
-					date: new Date().toISOString(),
-					id: messageId++
-				})
-			);
-
-			return responsePromise;
-		});
-	};
-
-	/**
-	* Handler for query requests.
-	* @template Req Request type
-	*/
-	type QueryHandler<Req> = (args: {
-		data: Req;
-		id: number;
-		date: Date;
-		requestId: string;
-		responseChannel: string;
-	}) => Promise<unknown> | unknown;
-
-	/**
-	* Listens for queries on a service/event and responds using a handler.
-	* @template Req Request type
-	* @param service Service name
-	* @param event Event name
-	* @param reqSchema Zod schema for request
-	* @param handler Handler function
-	*/
-	export const queryListen = <Req>(
-		service: string,
-		event: string,
-		reqSchema: z.ZodType<Req>,
-		handler: QueryHandler<Req>
-	) => {
-		const channel = `query:${service}:${event}`;
-
-		_sub?.subscribe(channel, async (message: string) => {
-			try {
-				const parsed = z
-					.object({
-						data: z.unknown(),
-						requestId: z.string(),
-						responseChannel: z.string(),
-						date: z.string().transform((v) => new Date(v)),
-						id: z.number()
-					})
-					.parse(JSON.parse(message));
-
-				const validatedReq = reqSchema.safeParse(parsed.data);
-				if (!validatedReq.success) {
-					console.error(`[queryListen:${channel}] Invalid request:`, validatedReq.error);
-					return;
-				}
-
-				const responseData = await handler({
-					data: validatedReq.data,
-					id: parsed.id,
-					date: parsed.date,
-					requestId: parsed.requestId,
-					responseChannel: parsed.responseChannel
-				});
-
-				await _pub?.publish(
-					parsed.responseChannel,
-					JSON.stringify({
-						data: responseData,
-						date: new Date().toISOString(),
-						id: messageId++
-					})
-				);
-			} catch (err) {
-				console.error(`[queryListen:${channel}] Error:`, err);
-			}
-		});
-	};
-
-	/**
-	* Enqueues a task to a Redis queue.
-	* @template T Task type
-	* @param queueName Queue name
-	* @param task Task data
-	* @param notify Whether to notify subscribers
-	* @returns ResultPromise<void>
-	*/
-	const enqueue = <T>(queueName: string, task: T, notify = false) => {
+	close() {
 		return attemptAsync(async () => {
-			const serialized = JSON.stringify(task);
-			await _queue?.rPush(`queue:${queueName}`, serialized);
-			if (notify) await _pub?.publish(`queue:${queueName}`, serialized); // Optional: publish to notify subscribers
+			await Promise.all([
+				this.pub.quit(),
+				this.sub.quit(),
+				this.cache.quit(),
+			]);
+			this.listeningServices.clear();
 		});
-	};
-
-	/**
-	* Dequeues a task from a Redis queue, validating with schema.
-	* @template T Task type
-	* @param queueName Queue name
-	* @param schema Zod schema for task
-	* @param timeout Timeout in seconds
-	* @returns ResultPromise<T | null>
-	*/
-	const dequeue = <T>(queueName: string, schema: z.ZodType<T>, timeout = 0) => {
-		return attemptAsync<T | null>(async () => {
-			const key = `queue:${queueName}`;
-			const result = await _queue?.blPop(key, timeout);
-
-			if (!result || !result.element) return null;
-
-			try {
-				const parsed = JSON.parse(result.element);
-				return schema.parse(parsed);
-			} catch (err) {
-				console.error(`[dequeue:${key}] Failed to parse or validate task`, err);
-				throw err;
-			}
-		});
-	};
-
-	/**
-	* Clears all tasks from a Redis queue.
-	* @param queueName Queue name
-	* @returns ResultPromise<void>
-	*/
-	const clearQueue = (queueName: string) => {
-		return attemptAsync(async () => {
-			const key = `queue:${queueName}`;
-			await _queue?.del(key);
-		});
-	};
-
-	/**
-	* Gets the length of a Redis queue.
-	* @param queueName Queue name
-	* @returns ResultPromise<number>
-	*/
-	const getQueueLength = (queueName: string) => {
-		return attemptAsync(async () => {
-			const key = `queue:${queueName}`;
-			const length = await _queue?.lLen(key);
-			return length ?? 0;
-		});
-	};
-
-	/**
-	* Service for managing a Redis-backed queue with typed tasks.
-	* @template T Task type
-	*/
-	class QueueService<T> {
-		private _running = false;
-		private em = new EventEmitter<{
-			data: T;
-			stop: void;
-			error: Error;
-			start: void;
-		}>();
-
-		public on = this.em.on.bind(this.em);
-		public once = this.em.once.bind(this.em);
-		public off = this.em.off.bind(this.em);
-
-		constructor(
-			public readonly name: string,
-			public readonly schema: z.ZodType<T>
-		) {}
-
-		put(data: T, notify = false) {
-			return enqueue(this.name, data, notify);
-		}
-
-		length() {
-			return getQueueLength(this.name);
-		}
-
-		clear() {
-			return clearQueue(this.name);
-		}
-
-		start() {
-			if (this._running) {
-				console.warn(`QueueService "${this.name}" is already running.`);
-				return this.stop.bind(this);
-			}
-
-			this._running = true;
-			const run = async () => {
-				while (this._running) {
-					try {
-						const task = await dequeue(this.name, this.schema, 1000).unwrap();
-						if (task) {
-							this.em.emit('data', task);
-						} else {
-							// No task available, wait a bit before checking again
-							await new Promise((resolve) => setTimeout(resolve, 100));
-						}
-					} catch (err) {
-						console.error(`[QueueService:${this.name}] Error processing task:`, err);
-						this.em.emit('error', err as Error);
-					}
-					await sleep(100); // Prevent tight loop
-				}
-			};
-
-			run().catch((err) => {
-				console.error(`[QueueService:${this.name}] Error in run loop:`, err);
-				this.em.emit('error', err as Error);
-			});
-
-			return this.stop.bind(this);
-		}
-
-		stop() {
-			this._running = false;
-		}
-
-		get running() {
-			return this._running;
-		}
 	}
-
-	/**
-	* Creates a new QueueService for a queue and schema.
-	* @template T Task type
-	* @param queueName Queue name
-	* @param schema Zod schema for task
-	* @returns QueueService<T>
-	*/
-	export const createQueueService = <T>(queueName: string, schema: z.ZodType<T>) => {
-		return new QueueService(queueName, schema);
-	};
-
-	/**
-	* Data packet for a Redis stream.
-	* @template T Stream data type
-	*/
-	type StreamData<T> = {
-		data: T;
-		date: Date;
-		packet: number;
-		id: number;
-	};
-
-	/**
-	* End packet for a Redis stream.
-	*/
-	type StreamEnd = {
-		id: number;
-		date: Date;
-	};
-
-	/**
-	* Emits a stream of data packets to a Redis stream channel.
-	* @template T Stream data type
-	* @param streamName Stream channel name
-	* @param stream Stream object
-	* @returns ResultPromise<void>
-	*/
-	export const emitStream = <T>(streamName: string, stream: Stream<T>) => {
-		return attemptAsync(async () => {
-			const id = messageId++;
-			let packet = 0;
-
-			stream.on('data', async (data) => {
-				const payload: StreamData<T> = {
-					data,
-					date: new Date(),
-					packet: packet++,
-					id
-				};
-
-				const serialized = JSON.stringify(payload);
-				await _pub?.publish(`stream:${streamName}`, serialized);
-			});
-
-			stream.once('end', async () => {
-				const endPayload: StreamEnd = {
-					id,
-					date: new Date()
-				};
-
-				const serializedEnd = JSON.stringify(endPayload);
-				await _pub?.publish(`stream:${streamName}`, serializedEnd);
-			});
-
-			return new Promise<void>((res) => {
-				stream.on('end', res);
-			});
-		});
-	};
-
-	/**
-	* Listens for data packets on a Redis stream channel.
-	* @template T Stream data type
-	* @param streamName Stream channel name
-	* @param schema Zod schema for stream data
-	* @param handler Handler for data packets
-	* @param onEnd Optional handler for stream end
-	* @returns ResultPromise<void>
-	*/
-	export const listenStream = <T>(
-		streamName: string,
-		schema: z.ZodType<T>,
-		handler: (data: T, date: Date, packet: number, id: number) => void,
-		onEnd?: (id: number, date: Date) => void
-	) => {
-		return attemptAsync<void>(async () => {
-			const streamDataSchema = z.object({
-				data: z.unknown(),
-				date: z.string().transform((v) => new Date(v)),
-				packet: z.number(),
-				id: z.number()
-			});
-
-			const streamEndSchema = z.object({
-				id: z.number(),
-				date: z.string().transform((v) => new Date(v))
-			});
-
-			await _sub?.subscribe(`stream:${streamName}`, (message: string) => {
-				try {
-					const raw = JSON.parse(message);
-
-					// Try parsing as StreamData
-					if ('data' in (raw as any) && 'packet' in (raw as any)) {
-						const parsed = streamDataSchema.parse(raw);
-						const validated = schema.parse(parsed.data);
-						handler(validated, parsed.date, parsed.packet, parsed.id);
-					} else {
-						// Fallback to StreamEnd
-						const parsed = streamEndSchema.parse(raw);
-						onEnd?.(parsed.id, parsed.date);
-					}
-				} catch (err) {
-					console.error(`[listenStream:${streamName}] Invalid stream message:`, err);
-				}
-			});
-		});
-	};
-
-	/**
-	* Sets a value in Redis with optional TTL.
-	* @param key Redis key
-	* @param value Value to set
-	* @param ttl Optional time-to-live in seconds
-	* @returns ResultPromise<void>
-	*/
-	export const setValue = (key: string, value: unknown, ttl?: number) => {
-		return attemptAsync(async () => {
-			const serializedValue = JSON.stringify(value);
-			await _pub?.set(key, serializedValue);
-			if (ttl) {
-				await _pub?.expire(key, ttl);
-			}
-			// log(`Set value for key "${key}":`, value);
-		});
-	};
-
-	/**
-	* Gets and validates a value from Redis.
-	* @param key Redis key
-	* @param returnType Zod schema for value
-	* @returns ResultPromise<any | null>
-	*/
-	export const getValue = (key: string, returnType: z.ZodType) => {
-		return attemptAsync(async () => {
-			const serializedValue = await _pub?.get(key);
-			if (!serializedValue) {
-				// log(`No value found for key "${key}"`);
-				return null;
-			}
-			try {
-				const parsedValue = JSON.parse(serializedValue);
-				return returnType.parse(parsedValue);
-			} catch (err) {
-				console.error(`Error parsing value for key "${key}":`, err);
-				throw new Error(`Invalid value for key "${key}"`);
-			}
-		});
-	};
-
-	/**
-	* Gets the Redis publisher client, or throws if not initialized.
-	* @returns Result<RedisClient>
-	*/
-	export const getPub = (): Result<ReturnType<typeof createClient>> => {
-		return attempt(() => {
-			if (!_pub) {
-				throw new Error('Redis publisher client is not initialized. Call connect() first.');
-			}
-			return _pub;
-		});
-	};
-
-	/**
-	* Gets the Redis subscriber client, or throws if not initialized.
-	* @returns Result<RedisClient>
-	*/
-	export const getSub = (): Result<ReturnType<typeof createClient>> => {
-		return attempt(() => {
-			if (!_sub) {
-				throw new Error('Redis subscriber client is not initialized. Call connect() first.');
-			}
-			return _sub;
-		});
-	};
-
-	/**
-	* Increments a Redis key by a given value, initializing if needed.
-	* @param key Redis key
-	* @param increment Amount to increment by
-	* @returns ResultPromise<number>
-	*/
-	export const incr = (key: string, increment = 1) => {
-		return attemptAsync(async () => {
-			if (!_pub) {
-				throw new Error('Redis publisher client is not initialized. Call connect() first.');
-			}
-			const has = await _pub.exists(key);
-			if (!has) {
-				// log(`Key "${key}" does not exist. Initializing to 0 before incrementing.`);
-				await _pub.set(key, '0');
-			}
-
-			const count = await _pub.incrBy(key, increment);
-			// log(`Incremented key "${key}" by ${increment}. New value: ${count}`);
-			return count;
-		});
-	};
-
-	/**
-	* Sets expiration for a Redis key in seconds.
-	* @param key Redis key
-	* @param seconds Expiration time in seconds
-	* @returns ResultPromise<number>
-	*/
-	export const expire = (key: string, seconds: number) => {
-		return attemptAsync(async () => {
-			if (!_pub) {
-				throw new Error('Redis publisher client is not initialized. Call connect() first.');
-			}
-			const result = await _pub.expire(key, seconds);
-			// if (result) {
-			// 	log(`Set expiration for key "${key}" to ${seconds} seconds.`);
-			// } else {
-			// 	log(`Failed to set expiration for key "${key}". Key may not exist.`);
-			// }
-			return result;
-		});
-	};
 }
