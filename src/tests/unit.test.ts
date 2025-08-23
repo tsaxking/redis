@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { z } from 'zod';
 import { Redis } from '../index';
+import { v4 as uuid } from 'uuid';
 
-  const A = new Redis({ name: 'test-a' });
-  const B = new Redis({ name: 'test-b' });
+  const A = new Redis({ name: 'test-a', debug: true, id: uuid() });
+  const B = new Redis({ name: 'test-b', debug: true, id: uuid() });
 
   describe('Redis Microservice Package', () => {
     beforeAll(async () => {
@@ -45,7 +46,7 @@ import { Redis } from '../index';
 
     it('QueueService: add/stack/length/clear', async () => {
       const schema = z.object({ foo: z.string() });
-      const queue = A.createQueue('queue1', schema);
+      const queue = A.createQueue('queue1', schema, 100);
       await queue.add({ foo: 'bar' }).unwrap();
       await queue.add({ foo: 'baz' }).unwrap();
       const stack = await queue.stack().unwrap();
@@ -67,17 +68,29 @@ import { Redis } from '../index';
       expect(received).toBe('hello world');
     });
 
-    it('ConnectionService: send/ack/response', async () => {
-      const events = { ping: z.string(), pong: z.string() };
-      const connA = A.createConnection('test-b', events);
-      const connB = B.createConnection('test-a', events);
-      connB.subscribe('ping', (data) => {
-        expect(data).toBe('hello');
-        return 'pong!';
+    it('ConnectionService', async () => {
+      const server = A.createServer({
+        ping: z.string(),
+      }, 100);
+
+      const client = B.createClient('test-a', 100);
+
+      await server.init().unwrap();
+      await client.init().unwrap();
+
+      let received: string | undefined;
+      server.subscribe('ping', (data) => {
+        received = data;
+        return 'pong';
       });
-      connA.init();
-      connB.init();
-      const result = await connA.send('ping', { data: 'hello', timeout: 500, returnType: z.string() }).unwrap();
-      expect(result).toBe('pong!');
-    });
+
+      const response = await client.send('ping',  {
+        data: 'hello',
+        timeout: 2000,
+        returnType: z.string(),
+      }).unwrap();
+
+      expect(received).toBe('hello');
+      expect(response).toBe('pong');
+    }, 10000);
   });

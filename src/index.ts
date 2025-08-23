@@ -10,7 +10,7 @@ import { sleep } from "ts-utils/sleep";
  * Listens to events emitted from other microservices via Redis pub/sub.
  * @template Events Event schema map
  */
-export class ListeningService<Events extends Record<string, z.ZodTypeAny>> {
+export class ListeningService<Name extends string, Events extends Record<string, z.ZodTypeAny>> {
     private readonly em = new ComplexEventEmitter<{
         [K in keyof Events]: [{
             data: z.infer<Events[K]>;
@@ -24,7 +24,7 @@ export class ListeningService<Events extends Record<string, z.ZodTypeAny>> {
     public readonly once = this.em.once.bind(this.em);
     
     constructor(
-        public readonly redis: Redis,
+        public readonly redis: Redis<Name>,
         public readonly target: string,
         public readonly events: Events,
     ) {}
@@ -69,39 +69,38 @@ export class ListeningService<Events extends Record<string, z.ZodTypeAny>> {
  * Provides two-way, ack-based, type-safe communication between two microservices using Redis queues.
  * @template Events Event schema map
  */
-export class ConnectionService<Events extends Record<string, z.ZodTypeAny>> {
+export class ConnectionClientService<Name extends string> {
     private messageId = -1;
 
-    private readonly sendQueue: QueueService<{
+    private readonly queue: QueueService<Name, {
         event: string;
         data?: unknown;
         id: number;
-    }>;
-    private readonly recieveQueue: QueueService<{
-        event: string;
-        data?: unknown;
-        id: number;
+        name: string;
     }>;
 
-    private readonly ackQueue = new Map<number, (data: unknown) => void>();
-    private readonly subscribers = new Map<keyof Events, (data: z.infer<Events[keyof Events]>) => unknown>();
+    private readonly responseQueue = new Map<number, (data: unknown) => void>();
 
     constructor(
-        public readonly redis: Redis,
-        public readonly target: string,
-        public readonly events: Events,
+        public readonly redis: Redis<Name>,
+        public readonly config: {
+            target: string;
+            maxSize: number;
+        }
     ) {
         const eventSchema = z.object({
-            event: z.string().refine(e => Object.keys(events).includes(e), {
-                message: 'Unknown event',
-            }),
+            event: z.string(),
             data: z.unknown(),
             id: z.number(),
+            name: z.string(),
         });
 
         // cache if the connection dies
-        this.sendQueue = redis.createQueue(`connection:${this.redis.name}:${this.target}`, eventSchema);
-        this.recieveQueue = redis.createQueue(`connection:${this.target}:${this.redis.name}`, eventSchema);
+        this.queue = redis.createQueue(`connection:${this.target}`, eventSchema, this.config.maxSize);
+    }
+
+    get target() {
+        return this.config.target;
     }
 
     /**
@@ -112,52 +111,23 @@ export class ConnectionService<Events extends Record<string, z.ZodTypeAny>> {
         polling?: number;
     }) {
         return attempt(() => {
-            this.sendQueue.init(config).unwrap();
-            this.recieveQueue.init(config).unwrap();
-
-            this.recieveQueue.on('data', async (data) => {
-                const { event, data: eventData, id } = data;
-                const schema = this.events[event as keyof Events];
-                if (!schema) {
-                    this.redis.log(`Received unknown event ${event} from ${this.target}`);
-                    return;
-                }
-                const parsed = schema.safeParse(eventData);
-                if (!parsed.success) {
-                    this.redis.log(`Failed to parse event ${event} from ${this.target}:`, parsed.error);
-                    return;
-                }
-                this.redis.log(`Received event ${event} from ${this.target}:`, parsed.data);
-
-                const listener = this.subscribers.get(event as keyof Events);
-                if (listener) {
-                    try {
-                        const res = await listener(parsed.data);
-                        this.ack(id, res);
-                    } catch (err) {
-                        this.redis.log(`Error in listener for event ${event} from ${this.target}:`, err);
-                    }
-                } else {
-                    this.redis.log(`No listener for event ${event} from ${this.target}`);
-                }
-            });
-
-            this.redis.sub.subscribe(`connection:ack:${this.redis.name}:${this.target}`, (message) => {
+            this.queue.init(config).unwrap();
+            this.redis.sub.subscribe(`connection:response:${this.redis.name}:${this.target}`, (message) => {
                 const parsed = z.object({
                     id: z.number(),
                     data: z.unknown(),
                 }).safeParse(JSON.parse(message));
                 if (!parsed.success) {
-                    this.redis.log(`Received invalid ack message: ${message}`);
+                    this.redis.log(`Received invalid response: ${message}`);
                     return;
                 }
                 const { id, data } = parsed.data;
                 if (isNaN(id)) {
-                    this.redis.log(`Received invalid ack message: ${message}`);
+                    this.redis.log(`Received invalid response: ${message}`);
                     return;
                 }
-                this.redis.log(`Received ack for message id ${id} from ${this.target}`);
-                const ack = this.ackQueue.get(id);
+                this.redis.log(`Received response for message id ${id} from ${this.target}`);
+                const ack = this.responseQueue.get(id);
                 if (ack) {
                     ack(data);
                 }
@@ -173,24 +143,24 @@ export class ConnectionService<Events extends Record<string, z.ZodTypeAny>> {
      * @param config Data, optional timeout, and optional returnType for response
      * @returns Promise resolving to R (if returnType is provided) or void
      */
-    send<K extends keyof Events, R = undefined>(event: K, config: {
-        data: z.infer<Events[K]>;
+    send<R = undefined>(event: string, config: {
+        data: unknown;
         timeout?: number;
         returnType?: z.ZodType<R>;
     }) {
         return attemptAsync<R>(async () => {
-            await this.sendQueue.add({ event: event as string, data: config.data, id: ++this.messageId });
+            await this.queue.add({ event: event as string, data: config.data, id: ++this.messageId, name: this.redis.name });
             this.redis.log(`Sent event ${String(event)} to ${this.target}:`, config.data);
 
             return new Promise<R>((res, rej) => {
                 const t = setTimeout(() => {
-                    this.ackQueue.delete(this.messageId);
+                    this.responseQueue.delete(this.messageId);
                     rej(new Error(`Ack timeout for message id ${this.messageId}`));
                 }, config.timeout);
 
-                this.ackQueue.set(this.messageId, (data) => {
+                this.responseQueue.set(this.messageId, (data) => {
                     clearTimeout(t);
-                    this.ackQueue.delete(this.messageId);
+                    this.responseQueue.delete(this.messageId);
                     if (config.returnType) {
                         const parsed = config.returnType.safeParse(data);
                         if (!parsed.success) {
@@ -205,34 +175,100 @@ export class ConnectionService<Events extends Record<string, z.ZodTypeAny>> {
             });
         });
     }
+}
 
-    /**
-     * Sends an ack for a received message back to the sender.
-     * @param id Message id
-     * @param data Optional return data
-     */
-    private ack(id: number, data: unknown) {
-        return attemptAsync(async () => {
-            await this.redis.pub.publish(`connection:ack:${this.target}:${this.redis.name}`, JSON.stringify({ id, data }));
-            this.redis.log(`Sent ack for message id ${id} to ${this.target}`);
+
+type MiddlewareFunction<T> = (data: T) => void | Promise<void>;
+type Subscriber<T> = (data: T) => unknown | Promise<unknown>;
+
+
+export class ConnectionServerService<Name extends string, Events extends Record<string, z.ZodTypeAny>> {
+    private readonly queue: QueueService<Name, {
+        event: string;
+        data?: unknown;
+        id: number;
+        name: string;
+    }>;
+
+    constructor(
+        public readonly redis: Redis<Name>,
+        public readonly config: {
+            events: Events;
+            maxSize: number;
+        }
+    ) {
+        const eventSchema = z.object({
+            event: z.string().refine(e => Object.keys(this.events).includes(e), {
+                message: 'Unknown event',
+            }),
+            data: z.unknown(),
+            id: z.number(),
+            name: z.string(),
         });
+
+        this.queue = redis.createQueue(`connection:${this.redis.name}`, eventSchema, this.config.maxSize);
     }
 
-    /**
-     * Subscribes to a specific event from the target service.
-     * @template K Event key
-     * @param event Event name
-     * @param listener Listener function
-     * @returns Unsubscribe function
-     */
-    public subscribe<K extends keyof Events>(event: K, listener: (data: z.infer<Events[K]>) => unknown) {
-        if (this.subscribers.has(event)) {
-            throw new Error(`Listener for event ${String(event)} already exists`);
+    get events() {
+        return this.config.events;
+    }
+
+    private readonly beforeMiddlewares = new Map<string, MiddlewareFunction<unknown>[]>();
+    private readonly subscribers = new Map<string, (data: unknown) => unknown | Promise<unknown>>();
+
+    public before<K extends keyof Events>(
+        event: K,
+        ...fn: MiddlewareFunction<z.infer<Events[K]>>[]
+    ) {
+        if (!this.beforeMiddlewares.has(event as string)) {
+            this.beforeMiddlewares.set(event as string, []);
         }
-        this.subscribers.set(event, listener);
+        this.beforeMiddlewares.get(event as string)!.push(...(fn as MiddlewareFunction<unknown>[]));
+    }
+
+    public subscribe<K extends keyof Events>(
+        event: K,
+        fn: Subscriber<z.infer<Events[K]>>
+    ) {
+        if (this.subscribers.has(event as string)) {
+            throw new Error(`Subscriber for event ${String(event)} already exists`);
+        }
+        this.subscribers.set(event as string, fn as (data: unknown) => unknown | Promise<unknown>);
+
         return () => {
-            this.subscribers.delete(event);
+            this.subscribers.delete(event as string);
         }
+    }
+
+    public init(config?: {
+        polling?: number;
+    }) {
+        return attempt(() => {
+            this.queue.init(config).unwrap();
+            this.queue.on('data', async ({ event, data, id, name }) => {
+                const schema = this.events[event as keyof Events];
+                if (!schema) {
+                    this.redis.log(`Received unknown event ${event} from connection`);
+                    return;
+                }
+                const dataParsed = schema.safeParse(data);
+                if (!dataParsed.success) {
+                    this.redis.log(`Failed to parse data for event ${event} from connection:`, dataParsed.error);
+                    return;
+                }
+                this.redis.log(`Received event ${event} from connection:`, dataParsed.data);
+                const middlewares = this.beforeMiddlewares.get(event as string) || [];
+                for (const mw of middlewares) {
+                    await mw(dataParsed.data);
+                }
+                const subscriber = this.subscribers.get(event as string);
+                let response: unknown;
+                if (subscriber) {
+                    response = await subscriber(dataParsed.data);
+                }
+                await this.redis.pub.publish(`connection:response:${name}:${this.redis.name}`, JSON.stringify({ id, data: response }));
+            });
+        });
     }
 }
 
@@ -240,7 +276,7 @@ export class ConnectionService<Events extends Record<string, z.ZodTypeAny>> {
  * Provides a type-safe Redis-backed queue with event emission for new data.
  * @template T Data type
  */
-export class QueueService<T> {
+export class QueueService<Name extends string, T> {
     private readonly em = new ComplexEventEmitter<{
         data: [T];
         clear: void;
@@ -252,10 +288,21 @@ export class QueueService<T> {
     public readonly once = this.em.once.bind(this.em);
 
     constructor(
-        public readonly redis: Redis,
-        public readonly name: string,
-        public readonly schema: z.ZodType<T>,
+        public readonly redis: Redis<Name>,
+        public readonly config: {
+            name: string;
+            schema: z.ZodType<T>;
+            maxSize: number;
+        }
     ) {}
+
+    get name() {
+        return this.config.name;
+    }
+
+    get schema() {
+        return this.config.schema;
+    }
 
     /**
      * Initializes the queue and starts polling for new items.
@@ -271,6 +318,7 @@ export class QueueService<T> {
             // listens for new items in the queue
             const listen = async () => {
                 while (true) {
+                    this.redis.log('Listening for new items in queue', this.name);
                     await sleep(config?.polling || 50 + Math.floor(Math.random() * (config?.jitter || 10)));
                     const item = await this.redis.cache.lPop(`queue:${this.name}`);
                     if (item) {
@@ -337,15 +385,23 @@ export class QueueService<T> {
             this.redis.log(`Cleared queue ${this.name}`);
         });
     }
+
+    delete(index: number) {
+        return attemptAsync(async () => {
+            await this.redis.cache.lSet(`queue:${this.name}`, index, '__deleted__');
+            await this.redis.cache.lRem(`queue:${this.name}`, 0, '__deleted__');
+            this.redis.log(`Deleted item at index ${index} from queue ${this.name}`);
+        });
+    }
 }
 
 /**
  * Provides type-safe get/set/delete/expire operations for a single Redis key.
  * @template T Data type
  */
-export class ItemService<T> {
+export class ItemService<Name extends string, T> {
     constructor(
-        public readonly redis: Redis,
+        public readonly redis: Redis<Name>,
         public readonly name: string,
         public readonly schema: z.ZodType<T>,
     ) {
@@ -414,8 +470,8 @@ export class ItemService<T> {
     }
 }
 
-export class NumberService extends ItemService<number> {
-    constructor(redis: Redis, name: string) {
+export class NumberService<Name extends string> extends ItemService<Name, number> {
+    constructor(redis: Redis<Name>, name: string) {
         super(redis, name, z.number());
         this.redis.log(`NumberService initialized for ${name}`);
     }
@@ -445,8 +501,8 @@ export class NumberService extends ItemService<number> {
     }
 }
 
-export class StringService extends ItemService<string> {
-    constructor(redis: Redis, name: string) {
+export class StringService<Name extends string> extends ItemService<Name, string> {
+    constructor(redis: Redis<Name>, name: string) {
         super(redis, name, z.string());
         this.redis.log(`StringService initialized for ${name}`);
     }
@@ -466,7 +522,7 @@ export class StringService extends ItemService<string> {
 /**
  * Main Redis utility class for microservice communication, queue, and item management.
  */
-export class Redis {
+export class Redis<Name extends string> {
     public readonly id: string;
     public readonly pub: ReturnType<typeof createClient>;
     public readonly sub: ReturnType<typeof createClient>;
@@ -481,7 +537,7 @@ export class Redis {
     
     constructor(
         public readonly config: {
-            name: string;
+            name: Name;
             port?: number;
             host?: string;
             password?: string;
@@ -553,6 +609,7 @@ export class Redis {
                         res();
                     }
                 });
+                this.log('Sending discovery:i_am message');
                 this.pub.publish('discovery:i_am', this.name + ':' + this.id);
                 setTimeout(() => {
                     rej(new Error('Redis connection timed out. Please check your Redis server.'));
@@ -581,15 +638,15 @@ export class Redis {
      * @param schema Zod schema (required for 'object')
      * @returns ItemService, NumberService, or StringService
      */
-    createItem<T>(name: string, type: 'object', schema: z.ZodType<T>): ItemService<T>;
-    createItem(name: string, type: 'number'): NumberService;
-    createItem(name: string, type: 'string'): StringService;
+    createItem<T>(name: string, type: 'object', schema: z.ZodType<T>): ItemService<Name, T>;
+    createItem(name: string, type: 'number'): NumberService<Name>;
+    createItem(name: string, type: 'string'): StringService<Name>;
     createItem<T>(name: string, type: 'object' | 'number' | 'string', schema?: z.ZodType<T>) {
         this.log(`Creating item service for ${name} of type ${type}`);
         switch (type) {
             case 'object':
                 if (!schema) throw new Error('Schema is required for object type');
-                return new ItemService<T>(this, name, schema);
+                return new ItemService<Name, T>(this, name, schema);
             case 'number':
                 return new NumberService(this, name);
             case 'string':
@@ -606,9 +663,9 @@ export class Redis {
      * @param schema Zod schema
      * @returns QueueService<T>
      */
-    createQueue<T>(name: string, schema: z.ZodType<T>) {
+    createQueue<T>(name: string, schema: z.ZodType<T>, maxSize: number) {
         this.log(`Creating queue service for ${name}`);
-        return new QueueService<T>(this, name, schema);
+        return new QueueService<Name, T>(this, { name, schema, maxSize });
     }
 
     /**
@@ -618,11 +675,21 @@ export class Redis {
      * @param events Event schema map
      * @returns ConnectionService<Events>
      */
-    createConnection<Events extends Record<string, z.ZodTypeAny>>(target: string, events: Events) {
-        return new ConnectionService<Events>(this, target, events);
+    createClient(target: string, maxSize: number) {
+        return new ConnectionClientService(this, {
+            target,
+            maxSize,
+        });
     }
 
-    private readonly listeningServices = new Set<ListeningService<any>>();
+    createServer<Events extends Record<string, z.ZodTypeAny>>(events: Events, maxSize: number) {
+        return new ConnectionServerService(this, {
+            events,
+            maxSize,
+        });
+    }
+
+    private readonly listeningServices = new Set<ListeningService<Name, any>>();
 
     /**
      * Creates a listening service for pub/sub events from a target.
@@ -632,7 +699,7 @@ export class Redis {
      * @returns ListeningService<Events>
      */
     createListener<Events extends Record<string, z.ZodTypeAny>>(target: string, events: Events) {
-        const service = new ListeningService<Events>(this, target, events);
+        const service = new ListeningService<Name, Events>(this, target, events);
         this.listeningServices.add(service);
         return service;
     }
