@@ -544,6 +544,62 @@ export class ItemGroupService<Name extends string, T> {
             return this.schema.parse(JSON.parse(data));
         });
     }
+
+    expire(key: string, seconds: number) {
+        return attemptAsync(async () => {
+            const fullKey = `${this.prefix}:${key}`;
+            await this.redis.cache.expire(fullKey, seconds);
+            this.redis.log(`Set expiration for item ${fullKey} to ${seconds} seconds`);
+        });
+    }
+
+    deleteItem(key: string) {
+        return attemptAsync(async () => {
+            const fullKey = `${this.prefix}:${key}`;
+            await this.redis.cache.del(fullKey);
+            this.redis.log(`Deleted item ${fullKey}`);
+        });
+    }
+
+    expiresAt(key: string, timestamp: number) {
+        return attemptAsync(async () => {
+            const fullKey = `${this.prefix}:${key}`;
+            await this.redis.cache.expireat(fullKey, timestamp);
+            this.redis.log(`Set expiration for item ${fullKey} at ${new Date(timestamp * 1000).toISOString()}`);
+        });
+    }
+
+    listKeys() {
+        return attemptAsync(async () => {
+            const keys = await this.redis.cache.keys(`${this.prefix}:*`);
+            return keys.map(k => k.substring(this.prefix.length + 1));
+        });
+    }
+
+    listItems() {
+        return attemptAsync(async () => {
+            const keys = await this.listKeys().unwrap();
+            const items = await Promise.all(keys.map(k => this.getItem(k).unwrap().then(v => ({ key: k, value: v }))));
+            return items;
+        });
+    }
+
+    count() {
+        return attemptAsync(async () => {
+            const keys = await this.redis.cache.keys(`${this.prefix}:*`);
+            return keys.length;
+        });
+    }
+
+    clear() {
+        return attemptAsync(async () => {
+            const keys = await this.redis.cache.keys(`${this.prefix}:*`);
+            if (keys.length > 0) {
+                await this.redis.cache.del(keys);
+            }
+            this.redis.log(`Cleared all items with prefix ${this.prefix}`);
+        });
+    }
 }
 
 export class NumberItemGroupService<Name extends string> extends ItemGroupService<Name, number> {
