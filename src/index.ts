@@ -518,6 +518,67 @@ export class StringService<Name extends string> extends ItemService<Name, string
     }
 }
 
+export class ItemGroupService<Name extends string, T> {
+    constructor(
+        public readonly redis: Redis<Name>,
+        public readonly prefix: string,
+        public readonly schema: z.ZodType<T>,
+    ) {}
+
+    createItem(key: string, value: T) {
+        return attemptAsync(async () => {
+            const fullKey = `${this.prefix}:${key}`;
+            await this.redis.cache.set(fullKey, JSON.stringify(value));
+            this.redis.log(`Set value for item ${fullKey}:`, value);
+            return this.schema.parse(value);
+        });
+    }
+
+    getItem(key: string) {
+        return attemptAsync<T>(async () => {
+            const fullKey = `${this.prefix}:${key}`;
+            const data = await this.redis.cache.get(fullKey);
+            if (data === null) {
+                throw new Error(`Item ${fullKey} not found`);
+            }
+            return this.schema.parse(JSON.parse(data));
+        });
+    }
+}
+
+export class NumberItemGroupService<Name extends string> extends ItemGroupService<Name, number> {
+    constructor(redis: Redis<Name>, prefix: string) {
+        super(redis, prefix, z.number());
+        this.redis.log(`NumberItemGroupService initialized for ${prefix}`);
+    }
+
+    incr(key: string, amount = 1) {
+        return attemptAsync(async () => {
+            const val = await this.getItem(key).unwrapOr(0);
+            const newValue = val + amount;
+            await this.createItem(key, newValue);
+            this.redis.log(`Incremented ${this.prefix}:${key} by ${amount}, new value: ${newValue}`);
+            return newValue;
+        });
+    }
+
+    decr(key: string, amount = 1) {
+        return this.incr(key, -amount);
+    }
+}
+
+export class StringItemGroupService<Name extends string> extends ItemGroupService<Name, string> {
+    constructor(redis: Redis<Name>, prefix: string) {
+        super(redis, prefix, z.string());
+        this.redis.log(`StringItemGroupService initialized for ${prefix}`);
+    }
+    length(key: string) {
+        return attemptAsync(async () => {
+            return this.getItem(key).unwrap().then(v => v.length);
+        });
+    }
+}
+
 
 /**
  * Main Redis utility class for microservice communication, queue, and item management.
@@ -651,6 +712,24 @@ export class Redis<Name extends string> {
                 return new NumberService(this, name);
             case 'string':
                 return new StringService(this, name);
+            default:
+                throw new Error(`Unknown item type: ${type}`);
+        }
+    }
+
+    createItemGroup<T>(prefix: string, type: 'object', schema: z.ZodType<T>): ItemGroupService<Name, T>;
+    createItemGroup(prefix: string, type: 'number'): NumberItemGroupService<Name>;
+    createItemGroup(prefix: string, type: 'string'): StringItemGroupService<Name>;
+    createItemGroup<T>(prefix: string, type: 'object' | 'number' | 'string', schema?: z.ZodType<T>) {
+        this.log(`Creating item group service for ${prefix} of type ${type}`);
+        switch (type) {
+            case 'object':
+                if (!schema) throw new Error('Schema is required for object type');
+                return new ItemGroupService<Name, T>(this, prefix, schema);
+            case 'number':
+                return new NumberItemGroupService(this, prefix);
+            case 'string':
+                return new StringItemGroupService(this, prefix);
             default:
                 throw new Error(`Unknown item type: ${type}`);
         }
