@@ -111,7 +111,7 @@ export class ConnectionClientService<Name extends string> {
         polling?: number;
     }) {
         return attempt(() => {
-            this.queue.init(config).unwrap();
+            this.queue.initPolling(config).unwrap();
             this.redis.sub.subscribe(`connection:response:${this.redis.name}:${this.target}`, (message) => {
                 const parsed = z.object({
                     id: z.number(),
@@ -244,7 +244,7 @@ export class ConnectionServerService<Name extends string, Events extends Record<
         polling?: number;
     }) {
         return attempt(() => {
-            this.queue.init(config).unwrap();
+            this.queue.initPolling(config).unwrap();
             this.queue.on('data', async ({ event, data, id, name }) => {
                 const schema = this.events[event as keyof Events];
                 if (!schema) {
@@ -308,7 +308,7 @@ export class QueueService<Name extends string, T> {
      * Initializes the queue and starts polling for new items.
      * @param config Optional polling and jitter configuration
      */
-    init(config?: {
+    initPolling(config?: {
         polling?: number;
         jitter?: number;
     }) {
@@ -391,6 +391,27 @@ export class QueueService<Name extends string, T> {
             await this.redis.cache.lSet(`queue:${this.name}`, index, '__deleted__');
             await this.redis.cache.lRem(`queue:${this.name}`, 0, '__deleted__');
             this.redis.log(`Deleted item at index ${index} from queue ${this.name}`);
+        });
+    }
+
+    pop(items = 1) {
+        return attemptAsync(async () => {
+            const results: T[] = [];
+            for (let i = 0; i < items; i++) {
+                const item = await this.redis.cache.lPop(`queue:${this.name}`);
+                if (item) {
+                    const parsed = this.schema.safeParse(JSON.parse(item));
+                    if (parsed.success) {
+                        results.push(parsed.data);
+                    } else {
+                        this.redis.log(`Failed to parse dequeued item for queue ${this.name}:`, parsed.error);
+                    }
+                } else {
+                    break;
+                }
+            }
+            this.redis.log(`Popped ${results.length} items from queue ${this.name}`);
+            return results;
         });
     }
 }
