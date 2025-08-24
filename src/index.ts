@@ -676,6 +676,7 @@ export class Redis<Name extends string> {
     constructor(
         public readonly config: {
             name: Name;
+            url?: string;
             port?: number;
             host?: string;
             password?: string;
@@ -683,10 +684,11 @@ export class Redis<Name extends string> {
             debug?: boolean;
         }
     ) {
-        const { port = 6379, host = "localhost", password } = config;
-        this.pub = createClient({ url: `redis://${host}:${port}`, password });
-        this.sub = createClient({ url: `redis://${host}:${port}`, password });
-        this.cache = createClient({ url: `redis://${host}:${port}`, password });
+        const url = config.url || `redis://${config.host || 'localhost'}:${config.port || 6379}`;
+        const { password } = config;
+        this.pub = createClient({ url: url, password });
+        this.sub = createClient({ url, password });
+        this.cache = createClient({ url, password });
         this.id = config.id || v4();
     }
 
