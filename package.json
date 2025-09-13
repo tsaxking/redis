@@ -22,9 +22,9 @@
   "dependencies": {
     "redis": "^5.5.6",
     "ts-utils": "github:tsaxking/global-ts-utilities",
-    "uuid": "^11.1.0",
+    "uuid": "13.0.0",
     "vitest": "^3.2.4",
-    "zod": "^3.25.64"
+    "zod": "4.1.8"
   },
   "exports": {
     ".": {
