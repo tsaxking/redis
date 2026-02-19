@@ -21,7 +21,7 @@ importers:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@24.3.0)
       zod:
-        specifier: ^3.25.64
+        specifier: ^3.25.76
         version: 3.25.76
     devDependencies:
       '@types/node':
