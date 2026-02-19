@@ -6,6 +6,7 @@
   "module": "lib/esm/index.js",
   "scripts": {
     "build": "tsc && tsc -p tsconfig.commonjs.json && node ./scripts/post-build.js",
+    "install": "npm run build",
     "test": "vitest",
     "format": "prettier --write .",
     "lint": "eslint . --ext .ts",
